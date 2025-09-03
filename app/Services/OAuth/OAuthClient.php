@@ -76,6 +76,7 @@ class OAuthClient implements OAuthClientContract
         $response = Http::asForm()->post($this->config['token_url'], [
             'grant_type'    => 'authorization_code',
             'client_id'     => $this->config['client_id'], // PKCE: no client_secret needed
+            'client_secret' => $this->config['client_secret'], // Not PKCE, So client_secret needed
             'redirect_uri'  => $this->config['redirect_uri'],
             'code_verifier' => $codeVerifier,
             'code'          => $queryParams['code'],
@@ -91,8 +92,29 @@ class OAuthClient implements OAuthClientContract
             abort(500, 'OAuth token exchange failed. Check logs.');
         }
 
+        // Step 4: Fetch user info and create or update local user
+        try {
+            $userInfo = $this->getUserInfo($data['access_token']);
+            if (isset($userInfo['sub'])) {
+                $user = \App\Models\User::firstOrCreate(
+                    ['email' => $userInfo['email']],
+                    [
+                        'name' => $userInfo['name'], 
+                        'email' => $userInfo['email'],
+                        'password' => bcrypt(Str::random(16)), // Random password OR Remove from users migration
+                    ]
+                );
+            } else {
+                \Log::error('OAuth user info missing Email', $userInfo);
+                abort(500, 'OAuth user info missing Email. Check logs.');
+            }
+        } catch (\Exception $e) {
+            \Log::error('Failed to fetch OAuth user info', ['error' => $e->getMessage()]);
+            abort(500, 'Failed to fetch OAuth user info. Check logs.');
+        }
+
         OAuthToken::updateOrCreate(
-            ['user_id' => auth()->id(), 'provider' => $this->provider],
+            ['user_id' => $user->id, 'provider' => $this->provider],
             [
                 'access_token'  => $data['access_token'],
                 'refresh_token' => $data['refresh_token'] ?? null,
@@ -100,7 +122,7 @@ class OAuthClient implements OAuthClientContract
             ]
         );
 
-        return $data;
+        return $user->toArray();
     }
 
     /**
@@ -121,6 +143,7 @@ class OAuthClient implements OAuthClientContract
      */
     public function getUserInfo(string $accessToken): array
     {
-        return Http::withToken($accessToken)->get($this->config['userinfo_url'])->json();
+        $response = Http::withToken($accessToken)->get($this->config['userinfo_url']);
+        return $response->json() ?? [];
     }
 }
