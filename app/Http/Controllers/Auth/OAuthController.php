@@ -26,7 +26,7 @@ class OAuthController extends Controller
 
         // Login or create user
         $userInfo = $oauth->getUserInfo($data['access_token']);
-        $user = Auth::loginUsingId($userInfo['id']); // adapt mapping
+        $user = Auth::loginUsingId($userInfo['id']); 
 
         return redirect('/dashboard');
     }

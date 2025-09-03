@@ -5,22 +5,30 @@ namespace App\Services\OAuth;
 use App\Models\OAuthToken;
 use App\Services\OAuth\Contracts\OAuthClientContract;
 use Illuminate\Support\Facades\Http;
-use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Str;
-use App\Events\TokenRefreshed;
 
 class OAuthClient implements OAuthClientContract
 {
-    protected $provider;
-    protected $config;
+    protected string $provider;
+    protected array $config;
 
     public function __construct(string $provider = 'einvoice')
     {
         $this->provider = $provider;
-        $this->config = config("oauth.providers.{$provider}");
+        $this->config = [
+            'client_id'     => env('OAUTH_EINVOICE_CLIENT_ID'),
+            'client_secret' => env('OAUTH_EINVOICE_CLIENT_SECRET'),
+            'auth_url'      => env('OAUTH_EINVOICE_AUTH_URL'),
+            'token_url'     => env('OAUTH_EINVOICE_TOKEN_URL'),
+            'userinfo_url'  => env('OAUTH_EINVOICE_USERINFO_URL'),
+            'redirect_uri'  => env('OAUTH_EINVOICE_REDIRECT_URI'),
+            'scope'         => env('OAUTH_EINVOICE_SCOPE'), // must match exactly
+        ];
     }
 
-    // Step 1: Generate redirect URL
+    /**
+     * Step 1: Generate the redirect URL with PKCE
+     */
     public function redirect(): string
     {
         $state = Str::random(40);
@@ -29,68 +37,88 @@ class OAuthClient implements OAuthClientContract
         $codeVerifier = Str::random(64);
         session(['code_verifier' => $codeVerifier]);
 
-        $codeChallenge = strtr(rtrim(base64_encode(hash('sha256', $codeVerifier, true)), '='), '+/', '-_');
+        $codeChallenge = strtr(
+            rtrim(base64_encode(hash('sha256', $codeVerifier, true)), '='),
+            '+/',
+            '-_'
+        );
 
-        return $this->config['auth_url'] . '?' . http_build_query([
-            'response_type' => 'code',
-            'client_id' => $this->config['client_id'],
-            'redirect_uri' => $this->config['redirect_uri'],
-            'scope' => $this->config['scope'],
-            'state' => $state,
-            'code_challenge' => $codeChallenge,
-            'code_challenge_method' => 'S256',
+        $query = http_build_query([
+            'response_type'          => 'code',
+            'client_id'              => $this->config['client_id'],
+            'redirect_uri'           => $this->config['redirect_uri'],
+            'scope'                  => $this->config['scope'],
+            'state'                  => $state,
+            'code_challenge'         => $codeChallenge,
+            'code_challenge_method'  => 'S256',
         ]);
+
+        return $this->config['auth_url'] . '?' . $query;
     }
 
-    // Step 2-3: Handle callback & exchange code for token
+    /**
+     * Step 2 & 3: Handle the callback & exchange code for token
+     */
     public function handleCallback(array $queryParams): array
     {
-        if ($queryParams['state'] !== session('oauth_state')) {
+        if (!isset($queryParams['code']) || !isset($queryParams['state'])) {
+            \Log::error('OAuth callback missing code or state', $queryParams);
+            abort(400, 'Authorization code or state missing.');
+        }
+
+        $storedState = session()->pull('oauth_state');
+        if ($queryParams['state'] !== $storedState) {
             abort(403, 'Invalid state');
         }
 
+        $codeVerifier = session()->pull('code_verifier');
+
         $response = Http::asForm()->post($this->config['token_url'], [
-            'grant_type' => 'authorization_code',
-            'client_id' => $this->config['client_id'],
-            'redirect_uri' => $this->config['redirect_uri'],
-            'code_verifier' => session('code_verifier'),
-            'code' => $queryParams['code'],
+            'grant_type'    => 'authorization_code',
+            'client_id'     => $this->config['client_id'], // PKCE: no client_secret needed
+            'redirect_uri'  => $this->config['redirect_uri'],
+            'code_verifier' => $codeVerifier,
+            'code'          => $queryParams['code'],
         ]);
 
         $data = $response->json();
 
-        // Store token encrypted
-        $token = OAuthToken::updateOrCreate(
+        if (!$response->successful() || !isset($data['access_token'])) {
+            \Log::error('OAuth token exchange failed', [
+                'status' => $response->status(),
+                'body'   => $data
+            ]);
+            abort(500, 'OAuth token exchange failed. Check logs.');
+        }
+
+        OAuthToken::updateOrCreate(
             ['user_id' => auth()->id(), 'provider' => $this->provider],
             [
-                'access_token' => $data['access_token'],
+                'access_token'  => $data['access_token'],
                 'refresh_token' => $data['refresh_token'] ?? null,
-                'expires_at' => now()->addSeconds($data['expires_in']),
+                'expires_at'    => now()->addSeconds($data['expires_in']),
             ]
         );
 
         return $data;
     }
 
-    // Step 5: Refresh token
+    /**
+     * Step 5: Refresh token
+     */
     public function refreshToken(string $refreshToken): array
     {
-        return Cache::lock("oauth_refresh_{$this->provider}", 10)->block(5, function () use ($refreshToken) {
-            $response = Http::asForm()->post($this->config['token_url'], [
-                'grant_type' => 'refresh_token',
-                'client_id' => $this->config['client_id'],
-                'refresh_token' => $refreshToken,
-                'scope' => $this->config['scope'],
-            ]);
-
-            $data = $response->json();
-
-            event(new TokenRefreshed(auth()->user(), $this->provider));
-
-            return $data;
-        });
+        return Http::asForm()->post($this->config['token_url'], [
+            'grant_type'    => 'refresh_token',
+            'client_id'     => $this->config['client_id'],
+            'refresh_token' => $refreshToken,
+            'scope'         => $this->config['scope'],
+        ])->json();
     }
 
+    /**
+     * Step 6: Get authenticated user info
+     */
     public function getUserInfo(string $accessToken): array
     {
         return Http::withToken($accessToken)->get($this->config['userinfo_url'])->json();
