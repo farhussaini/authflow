@@ -22,11 +22,14 @@ class OAuthController extends Controller
         $provider = $request->query('provider', 'einvoice');
         $oauth = new OAuthClient($provider);
 
-        $data = $oauth->handleCallback($request->query());
-
+        // $data = $oauth->handleCallback($request->query());
+        
         // Login or create user
-        $userInfo = $oauth->getUserInfo($data['access_token']);
-        $user = Auth::loginUsingId($userInfo['id']); 
+        // $userInfo = $oauth->getUserInfo($data['access_token']);
+        // $user = Auth::loginUsingId($userInfo['id']); 
+        
+        $user = $oauth->handleCallback($request->query());
+        Auth::loginUsingId($user['id']);
 
         return redirect('/dashboard');
     }
